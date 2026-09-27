@@ -25,7 +25,7 @@ except Exception:
 # =========================================================
 APP_NAME = "منصة خطوة"
 APP_SUBTITLE = "النظام الذكي الشامل للعيادات الأرطوفونية"
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 DATA_DIR = Path("clinic_storage")
 BACKUP_DIR = DATA_DIR / "backups"
 MEDIA_DIR = DATA_DIR / "media"
@@ -380,6 +380,9 @@ def default_user_data():
         "therapy_plans": [],
         "waitlist": [],
         "messages": [],
+        "supplies": [],
+        "supply_movements": [],
+        "reminders": [],
     }
 
 
@@ -468,7 +471,6 @@ if st.session_state["authenticated_user"] is None:
                     else:
                         st.error(f"❌ بيانات الدخول غير صحيحة. ({attempts}/5)")
 
-        st.caption("لأول تشغيل: اسم المستخدم `malia benflis` وكلمة المرور `0660451073`. غيّرها فوراً.")
     st.stop()
 
 
@@ -519,6 +521,86 @@ def patient_finances(patient_id):
 def patient_plan(patient_id):
     plans = [p for p in db["therapy_plans"] if p.get("patient_id") == patient_id]
     return plans[-1] if plans else None
+
+
+def supply_by_id(supply_id):
+    return next((item for item in db["supplies"] if item.get("id") == supply_id), None)
+
+
+def reminder_by_id(reminder_id):
+    return next((item for item in db["reminders"] if item.get("id") == reminder_id), None)
+
+
+def reminder_patient_label(reminder):
+    patient_id = reminder.get("patient_id")
+    return patient_name(patient_id) if patient_id else "عام"
+
+
+def reminder_is_overdue(reminder):
+    if reminder.get("status") in ["منجز", "ملغى"]:
+        return False
+    try:
+        return datetime.strptime(reminder.get("due_date", ""), "%Y-%m-%d").date() < date.today()
+    except Exception:
+        return False
+
+
+def add_supply_movement(supply_id, movement_type, quantity, note=""):
+    db.setdefault("supply_movements", []).append({
+        "id": uid("MOV"),
+        "supply_id": supply_id,
+        "supply_name": supply_by_id(supply_id).get("name", "") if supply_by_id(supply_id) else "",
+        "type": movement_type,
+        "quantity": float(quantity),
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "note": note,
+        "created_by": current_user,
+    })
+
+
+def create_next_recurring_reminder(reminder):
+    repeat = reminder.get("repeat", "لا يتكرر")
+    increments = {
+        "يومياً": timedelta(days=1),
+        "أسبوعياً": timedelta(days=7),
+    }
+    if repeat in increments:
+        next_date = datetime.strptime(reminder.get("due_date", ""), "%Y-%m-%d").date() + increments[repeat]
+    elif repeat == "شهرياً":
+        current_date = datetime.strptime(reminder.get("due_date", ""), "%Y-%m-%d").date()
+        if current_date.month == 12:
+            next_year, next_month = current_date.year + 1, 1
+        else:
+            next_year, next_month = current_date.year, current_date.month + 1
+        if next_month == 12:
+            following = date(next_year + 1, 1, 1)
+        else:
+            following = date(next_year, next_month + 1, 1)
+        last_day = (following - timedelta(days=1)).day
+        next_date = date(next_year, next_month, min(current_date.day, last_day))
+    else:
+        return False
+
+    series_id = reminder.get("series_id", reminder.get("id"))
+    already_exists = any(
+        item.get("series_id") == series_id and item.get("due_date") == str(next_date)
+        for item in db["reminders"]
+    )
+    if already_exists:
+        return False
+
+    next_reminder = dict(reminder)
+    next_reminder.update({
+        "id": uid("REM"),
+        "series_id": series_id,
+        "previous_id": reminder.get("id"),
+        "due_date": str(next_date),
+        "status": "مفتوح",
+        "completed_at": "",
+        "created_at": datetime.now().isoformat(timespec="minutes"),
+    })
+    db["reminders"].append(next_reminder)
+    return True
 
 
 def export_current_user_data():
@@ -578,16 +660,28 @@ if today_apts:
         unsafe_allow_html=True,
     )
 
+open_reminders_count = sum(
+    1 for item in db["reminders"]
+    if item.get("status", "مفتوح") not in ["منجز", "ملغى"]
+)
+if open_reminders_count:
+    st.sidebar.markdown(
+        f'<div style="background:#713f12;border-radius:10px;padding:8px 12px;margin:8px 6px;">'
+        f'<span style="color:#fde68a!important;font-size:.85rem;">🔔 {open_reminders_count} تذكير مفتوح</span></div>',
+        unsafe_allow_html=True,
+    )
+
 st.sidebar.write("---")
 
 menu_items = [
     "📊 لوحة القيادة",
-    "👥 إدارة المرضى",
-    "📁 ملف المريض الموحد",
+    "👥 إدارة الأطفال",
+    "📁 ملف الطفل الموحد",
     "📋 التقييمات والمقاييس",
     "🎯 خطط العلاج",
     "📝 الجلسات والمتابعة",
     "📅 المواعيد",
+    "🧰 لوازم الحصص والتذكيرات",
     "💰 الإدارة المالية",
     "🤖 المساعد الذكي",
     "📚 مكتبة العيادة",
@@ -639,7 +733,7 @@ if menu == "📊 لوحة القيادة":
 
     cols = st.columns(6)
     metrics = [
-        ("👥 المرضى", patients_count, "#2563eb"),
+        ("👥 الأطفال", patients_count, "#2563eb"),
         ("✅ نشطون", active_patients, "#059669"),
         ("📝 الجلسات", sessions_count, "#f59e0b"),
         ("📋 التقييمات", eval_count, "#7c3aed"),
@@ -751,8 +845,8 @@ if menu == "📊 لوحة القيادة":
         else:
             st.info("لا توجد مواعيد قادمة.")
 
-    # --- مرضى بمبالغ معلقة ---
-    st.subheader("⚠️ مرضى بمبالغ غير مسددة")
+    # --- أطفال بمبالغ معلقة ---
+    st.subheader("⚠️ أطفال بمبالغ غير مسددة")
     pending = []
     for p in db["patients"]:
         owed = pending_finances(p["id"])
@@ -765,12 +859,12 @@ if menu == "📊 لوحة القيادة":
 
 
 # =========================================================
-# 10) إدارة المرضى
+# 10) إدارة الأطفال
 # =========================================================
-elif menu == "👥 إدارة المرضى":
-    st.title("👥 إدارة المرضى والسجل الطبي")
+elif menu == "👥 إدارة الأطفال":
+    st.title("👥 إدارة الأطفال والسجل الطبي")
 
-    t_add, t_manage, t_waitlist = st.tabs(["➕ إضافة مريض", "🔍 البحث والتعديل", "⏳ قائمة الانتظار"])
+    t_add, t_manage, t_waitlist = st.tabs(["➕ إضافة طفل", "🔍 البحث والتعديل", "⏳ قائمة الانتظار"])
 
     with t_add:
         with st.form("patient_registration", clear_on_submit=True):
@@ -801,7 +895,7 @@ elif menu == "👥 إدارة المرضى":
             p_previous_therapy = st.text_area("تجارب علاجية سابقة")
             p_notes = st.text_area("ملاحظات أولية")
 
-            if st.form_submit_button("💾 إنشاء ملف المريض", use_container_width=True):
+            if st.form_submit_button("💾 إنشاء ملف الطفل", use_container_width=True):
                 errors = []
                 if not p_name.strip():
                     errors.append("الاسم الكامل مطلوب.")
@@ -842,7 +936,7 @@ elif menu == "👥 إدارة المرضى":
 
     with t_manage:
         if not db["patients"]:
-            st.info("لم يتم تسجيل أي مريض بعد.")
+            st.info("لم يتم تسجيل أي طفل بعد.")
         else:
             col_search, col_filter, col_sort = st.columns(3)
             search = col_search.text_input("🔎 ابحث بالاسم أو الهاتف أو الملف")
@@ -878,7 +972,7 @@ elif menu == "👥 إدارة المرضى":
                 }),
                 use_container_width=True, hide_index=True,
             )
-            st.caption(f"إجمالي: {len(patients_df)} مريض")
+            st.caption(f"إجمالي: {len(patients_df)} طفل")
 
             if len(patients_df) > 0:
                 selected = st.selectbox(
@@ -890,7 +984,7 @@ elif menu == "👥 إدارة المرضى":
                 if p:
                     col_e, col_d = st.columns(2)
                     with col_e:
-                        st.markdown("### ✏️ تعديل بيانات المريض")
+                        st.markdown("### ✏️ تعديل بيانات الطفل")
                         with st.form("edit_patient"):
                             new_name = st.text_input("الاسم", value=p.get("name", ""))
                             try:
@@ -933,11 +1027,11 @@ elif menu == "👥 إدارة المرضى":
                     with col_d:
                         st.markdown("### 🗑️ حذف الملف")
                         st.markdown(
-                            '<div class="warning-box">الحذف نهائي ويزيل جميع السجلات المرتبطة بهذا المريض.</div>',
+                            '<div class="warning-box">الحذف نهائي ويزيل جميع السجلات المرتبطة بهذا الطفل.</div>',
                             unsafe_allow_html=True,
                         )
                         if st.checkbox("أفهم أن الحذف نهائي لا رجعة فيه"):
-                            if st.button("🗑️ حذف ملف المريض", type="secondary"):
+                            if st.button("🗑️ حذف ملف الطفل", type="secondary"):
                                 delete_patient(selected)
                                 st.success("تم حذف الملف.")
                                 st.rerun()
@@ -976,11 +1070,11 @@ elif menu == "👥 إدارة المرضى":
                 }),
                 use_container_width=True, hide_index=True,
             )
-            # تحويل من قائمة الانتظار إلى مريض
+            # تحويل من قائمة الانتظار إلى طفل
             wl_ids = [w["id"] for w in db["waitlist"] if w.get("status") == "منتظر"]
             if wl_ids:
-                chosen_wl = st.selectbox("تحويل حالة إلى مريض مسجل:", wl_ids, format_func=lambda x: next((w["name"] for w in db["waitlist"] if w["id"] == x), x))
-                if st.button("✅ تحويل وتسجيل كمريض"):
+                chosen_wl = st.selectbox("تحويل حالة إلى طفل مسجل:", wl_ids, format_func=lambda x: next((w["name"] for w in db["waitlist"] if w["id"] == x), x))
+                if st.button("✅ تحويل وتسجيل كطفل"):
                     wl_item = next((w for w in db["waitlist"] if w["id"] == chosen_wl), None)
                     if wl_item:
                         patient_id = uid("PAT")
@@ -998,24 +1092,24 @@ elif menu == "👥 إدارة المرضى":
                         })
                         wl_item["status"] = "تم التحويل"
                         save_all_data()
-                        st.success(f"✅ تم تسجيل {wl_item['name']} كمريض برقم {patient_id}")
+                        st.success(f"✅ تم تسجيل {wl_item['name']} كطفل برقم {patient_id}")
                         st.rerun()
         else:
             st.info("قائمة الانتظار فارغة.")
 
 
 # =========================================================
-# 11) ملف المريض الموحد
+# 11) ملف الطفل الموحد
 # =========================================================
-elif menu == "📁 ملف المريض الموحد":
-    st.title("📁 ملف المريض الموحد")
+elif menu == "📁 ملف الطفل الموحد":
+    st.title("📁 ملف الطفل الموحد")
 
     if not db["patients"]:
-        st.warning("أضف مريضاً أولاً من قائمة إدارة المرضى.")
+        st.warning("أضف طفلاً أولاً من قائمة إدارة الأطفال.")
     else:
         patients = patients_dict()
         pid = st.selectbox(
-            "اختر المريض",
+            "اختر الطفل",
             list(patients),
             format_func=lambda x: f"{patients[x]} — {x}",
             index=list(patients).index(st.session_state["active_patient_id"])
@@ -1027,7 +1121,7 @@ elif menu == "📁 ملف المريض الموحد":
             st.error("لم يُعثر على هذا الملف.")
             st.stop()
 
-        # بطاقة هوية المريض
+        # بطاقة هوية الطفل
         age = age_label(p.get("dob", ""))
         badge_class = {"نشط": "badge-active", "متابعة": "badge-follow", "مغلق": "badge-closed"}.get(p.get("status", "نشط"), "badge-active")
         s_count = len(patient_sessions(pid))
@@ -1101,7 +1195,7 @@ elif menu == "📁 ملف المريض الموحد":
                 if len(sessions) > 10:
                     st.caption(f"وهناك {len(sessions)-10} جلسة أخرى.")
             else:
-                st.info("لا توجد جلسات مسجلة لهذا المريض.")
+                st.info("لا توجد جلسات مسجلة لهذا الطفل.")
 
         with tab_evals:
             evals = sorted(patient_evaluations(pid), key=lambda x: x.get("date", ""), reverse=True)
@@ -1112,7 +1206,7 @@ elif menu == "📁 ملف المريض الموحد":
                         if e.get("notes"):
                             st.write("الملاحظات:", e["notes"])
             else:
-                st.info("لا توجد تقييمات لهذا المريض.")
+                st.info("لا توجد تقييمات لهذا الطفل.")
 
         with tab_plan:
             plan = patient_plan(pid)
@@ -1142,7 +1236,7 @@ elif menu == "📁 ملف المريض الموحد":
                     "date": "التاريخ", "type": "النوع", "desc": "البيان", "amount": "المبلغ", "method": "طريقة الدفع"
                 }), use_container_width=True, hide_index=True)
             else:
-                st.info("لا توجد عمليات مالية لهذا المريض.")
+                st.info("لا توجد عمليات مالية لهذا الطفل.")
 
         with tab_apts:
             apts = sorted(patient_appointments(pid), key=lambda x: (x.get("date", ""), x.get("time", "")), reverse=True)
@@ -1153,7 +1247,7 @@ elif menu == "📁 ملف المريض الموحد":
                     "duration": "المدة (د)", "status": "الحالة",
                 }), use_container_width=True, hide_index=True)
             else:
-                st.info("لا توجد مواعيد لهذا المريض.")
+                st.info("لا توجد مواعيد لهذا الطفل.")
 
 
 # =========================================================
@@ -1163,10 +1257,10 @@ elif menu == "📋 التقييمات والمقاييس":
     st.title("📋 التقييمات والمقاييس")
 
     if not db["patients"]:
-        st.warning("أضف مريضاً أولاً.")
+        st.warning("أضف طفلاً أولاً.")
     else:
         patients = patients_dict()
-        selected_id = st.selectbox("👤 المريض", list(patients), format_func=lambda x: f"{patients[x]} — {x}")
+        selected_id = st.selectbox("👤 الطفل", list(patients), format_func=lambda x: f"{patients[x]} — {x}")
 
         t_new, t_history, t_compare = st.tabs(["➕ تقييم جديد", "📚 السجل", "📊 المقارنة"])
 
@@ -1255,7 +1349,7 @@ elif menu == "📋 التقييمات والمقاييس":
                         if e.get("recommendations"):
                             st.write("**التوصيات:**", e["recommendations"])
             else:
-                st.info("لا توجد تقييمات لهذا المريض.")
+                st.info("لا توجد تقييمات لهذا الطفل.")
 
         with t_compare:
             history_num = [e for e in db["evaluations"] if e.get("patient_id") == selected_id and isinstance(e.get("scores"), dict) and any(isinstance(v, (int, float)) for v in e.get("scores", {}).values())]
@@ -1282,10 +1376,10 @@ elif menu == "🎯 خطط العلاج":
     st.title("🎯 خطط العلاج")
 
     if not db["patients"]:
-        st.warning("أضف مريضاً أولاً.")
+        st.warning("أضف طفلاً أولاً.")
     else:
         patients = patients_dict()
-        pid = st.selectbox("المريض", list(patients), format_func=lambda x: f"{patients[x]} — {x}")
+        pid = st.selectbox("الطفل", list(patients), format_func=lambda x: f"{patients[x]} — {x}")
         p = patient_by_id(pid)
         existing_plan = patient_plan(pid)
 
@@ -1370,7 +1464,7 @@ elif menu == "🎯 خطط العلاج":
                     st.markdown("**🏠 برنامج المنزل:**")
                     st.write(plan["home_program"])
             else:
-                st.info("لا توجد خطة علاجية لهذا المريض. أنشئها من تبويب إنشاء الخطة.")
+                st.info("لا توجد خطة علاجية لهذا الطفل. أنشئها من تبويب إنشاء الخطة.")
 
         with t_progress:
             plan = patient_plan(pid)
@@ -1408,7 +1502,7 @@ elif menu == "📝 الجلسات والمتابعة":
     st.title("📝 الجلسات والمتابعة العلاجية")
 
     if not db["patients"]:
-        st.info("أضف مريضاً أولاً.")
+        st.info("أضف طفلاً أولاً.")
     else:
         patients = patients_dict()
         t_new, t_all, t_stats = st.tabs(["➕ جلسة جديدة", "🗂️ كل الجلسات", "📊 إحصائيات"])
@@ -1416,7 +1510,7 @@ elif menu == "📝 الجلسات والمتابعة":
         with t_new:
             with st.form("session_form"):
                 c1, c2 = st.columns(2)
-                s_pat = c1.selectbox("المريض", list(patients), format_func=lambda x: patients[x])
+                s_pat = c1.selectbox("الطفل", list(patients), format_func=lambda x: patients[x])
                 s_date = c2.date_input("التاريخ", value=date.today())
 
                 c3, c4, c5 = st.columns(3)
@@ -1436,7 +1530,17 @@ elif menu == "📝 الجلسات والمتابعة":
                                 st.write(f"• {g}")
 
                 s_activities = st.text_area("الأنشطة والتمارين المنفذة", height=80)
-                s_materials = st.text_input("المواد والأدوات المستخدمة")
+                available_supply_names = [item.get("name", "") for item in db["supplies"] if item.get("name")]
+                selected_supply_names = st.multiselect(
+                    "لوازم الحصة المستخدمة",
+                    available_supply_names,
+                    help="تتم قراءة هذه القائمة من قسم لوازم الحصص والتذكيرات.",
+                )
+                other_materials = st.text_input("لوازم أو أدوات أخرى")
+                deduct_session_materials = st.checkbox(
+                    "خصم قطعة واحدة من مخزون اللوازم المحددة عند حفظ الجلسة",
+                    value=False,
+                )
                 s_progress = st.slider("مستوى الإنجاز (%)", 0, 100, 50)
                 s_response = st.selectbox("استجابة الطفل", ["ممتازة", "جيدة", "متوسطة", "ضعيفة", "رفض التعاون"])
                 s_homework = st.text_area("برنامج المنزل لهذه الجلسة", height=60)
@@ -1458,13 +1562,28 @@ elif menu == "📝 الجلسات والمتابعة":
                         "duration": s_duration,
                         "goals": s_goals.strip(),
                         "activities": s_activities.strip(),
-                        "materials": s_materials.strip(),
+                        "materials": ", ".join(selected_supply_names + ([other_materials.strip()] if other_materials.strip() else [])),
                         "progress": s_progress,
                         "response": s_response,
                         "homework": s_homework.strip(),
                         "notes": s_notes.strip(),
                         "created_by": current_user,
                     })
+                    if deduct_session_materials:
+                        for supply_name in selected_supply_names:
+                            supply = next(
+                                (item for item in db["supplies"] if item.get("name") == supply_name),
+                                None,
+                            )
+                            if supply and float(supply.get("quantity", 0)) > 0:
+                                supply["quantity"] = max(0.0, float(supply.get("quantity", 0)) - 1)
+                                supply["updated_at"] = str(date.today())
+                                add_supply_movement(
+                                    supply["id"],
+                                    "استهلاك في جلسة",
+                                    1,
+                                    f"جلسة {session_id} — {patients[s_pat]}",
+                                )
                     if paid_session and session_price > 0:
                         db["finances"].append({
                             "transaction_id": uid("FIN"),
@@ -1482,7 +1601,7 @@ elif menu == "📝 الجلسات والمتابعة":
         with t_all:
             if db["sessions"]:
                 c_filter = st.columns(3)
-                filter_pat = c_filter[0].selectbox("تصفية بالمريض", ["الكل"] + list(patients.values()))
+                filter_pat = c_filter[0].selectbox("تصفية بالطفل", ["الكل"] + list(patients.values()))
                 filter_type = c_filter[1].selectbox("تصفية بالنوع", ["الكل"] + SESSION_TYPES)
 
                 sessions_df = pd.DataFrame(db["sessions"]).sort_values("date", ascending=False)
@@ -1495,7 +1614,7 @@ elif menu == "📝 الجلسات والمتابعة":
                 available = [c for c in show_cols if c in sessions_df.columns]
                 st.dataframe(
                     sessions_df[available].rename(columns={
-                        "patient_name": "المريض", "date": "التاريخ", "type": "النوع",
+                        "patient_name": "الطفل", "date": "التاريخ", "type": "النوع",
                         "duration": "المدة", "progress": "الإنجاز%", "response": "الاستجابة",
                     }),
                     use_container_width=True, hide_index=True,
@@ -1535,7 +1654,7 @@ elif menu == "📅 المواعيد":
     st.title("📅 إدارة المواعيد")
 
     if not db["patients"]:
-        st.info("أضف مرضى أولاً.")
+        st.info("أضف أطفالاً أولاً.")
     else:
         patients = patients_dict()
         t_add, t_view, t_calendar = st.tabs(["➕ إضافة موعد", "📋 عرض المواعيد", "📆 نظرة أسبوعية"])
@@ -1543,7 +1662,7 @@ elif menu == "📅 المواعيد":
         with t_add:
             with st.form("appointment_form"):
                 a, b, c = st.columns(3)
-                a_pat = a.selectbox("المريض", list(patients), format_func=lambda x: patients[x])
+                a_pat = a.selectbox("الطفل", list(patients), format_func=lambda x: patients[x])
                 a_date = b.date_input("التاريخ", value=date.today())
                 a_time = c.time_input("الوقت")
 
@@ -1578,6 +1697,25 @@ elif menu == "📅 المواعيد":
                             "reminder": a_reminder,
                             "created_by": current_user,
                         })
+                        if a_reminder:
+                            reminder_days = int(s_settings.get("reminder_days", 1))
+                            reminder_due_date = a_date - timedelta(days=max(0, reminder_days))
+                            db["reminders"].append({
+                                "id": uid("REM"),
+                                "title": f"تذكير بموعد الطفل — {patients[a_pat]}",
+                                "kind": "موعد",
+                                "priority": "مهمة",
+                                "due_date": str(reminder_due_date),
+                                "due_time": str(a_time)[:5],
+                                "repeat": "لا يتكرر",
+                                "patient_id": a_pat,
+                                "patient_name": patients[a_pat],
+                                "notes": f"الموعد بتاريخ {a_date} الساعة {str(a_time)[:5]}",
+                                "status": "مفتوح",
+                                "source_appointment_id": db["appointments"][-1]["appointment_id"],
+                                "created_at": datetime.now().isoformat(timespec="minutes"),
+                                "created_by": current_user,
+                            })
                         save_all_data()
                         write_audit("ADD_APPOINTMENT", f"patient={a_pat} date={a_date}")
                         st.success("✅ تمت إضافة الموعد.")
@@ -1607,7 +1745,7 @@ elif menu == "📅 المواعيد":
                 available = [c for c in show if c in df.columns]
                 st.dataframe(df[available].rename(columns={
                     "appointment_id": "الرقم", "date": "التاريخ", "time": "الوقت",
-                    "patient_name": "المريض", "type": "النوع", "duration": "المدة",
+                    "patient_name": "الطفل", "type": "النوع", "duration": "المدة",
                     "status": "الحالة",
                 }), use_container_width=True, hide_index=True)
 
@@ -1656,7 +1794,400 @@ elif menu == "📅 المواعيد":
 
 
 # =========================================================
-# 16) الإدارة المالية
+# 16) لوازم الحصص والتذكيرات
+# =========================================================
+elif menu == "🧰 لوازم الحصص والتذكيرات":
+    st.title("🧰 لوازم الحصص والتذكيرات")
+    st.caption("نظّم أدوات الحصص، راقب الكميات، ولا تفوّت موعداً أو مهمة مهمة.")
+
+    supplies = db["supplies"]
+    reminders = db["reminders"]
+    open_reminders = [r for r in reminders if r.get("status", "مفتوح") not in ["منجز", "ملغى"]]
+    overdue_reminders = [r for r in open_reminders if reminder_is_overdue(r)]
+    low_stock = [
+        item for item in supplies
+        if float(item.get("quantity", 0)) <= float(item.get("min_quantity", 0))
+    ]
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("📦 أصناف اللوازم", len(supplies))
+    summary_cols[1].metric("⚠️ مخزون منخفض", len(low_stock))
+    summary_cols[2].metric("🔔 تذكيرات مفتوحة", len(open_reminders))
+    summary_cols[3].metric("🚨 تذكيرات متأخرة", len(overdue_reminders))
+
+    tab_supplies, tab_supply_history, tab_reminders, tab_overview = st.tabs([
+        "📦 إدارة اللوازم", "📜 حركة المخزون", "🔔 إدارة التذكيرات", "📊 المتابعة السريعة"
+    ])
+
+    with tab_supplies:
+        st.subheader("📦 مخزون لوازم الحصص")
+        with st.form("add_supply_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            supply_name = c1.text_input("اسم الأداة أو الوسيلة *")
+            supply_category = c2.selectbox("الفئة", [
+                "بطاقات وصور", "ألعاب تعليمية", "أدوات فنية",
+                "أدوات نطق", "قرطاسية", "نظافة وسلامة", "أخرى"
+            ])
+            supply_unit = c3.text_input("وحدة القياس", value="قطعة")
+            c4, c5, c6 = st.columns(3)
+            supply_quantity = c4.number_input("الكمية الحالية", min_value=0.0, step=1.0)
+            supply_min = c5.number_input("حد التنبيه", min_value=0.0, step=1.0, value=1.0)
+            supply_location = c6.text_input("مكان التخزين")
+            supply_notes = st.text_area("ملاحظات")
+            if st.form_submit_button("➕ إضافة إلى المخزون", use_container_width=True):
+                if not supply_name.strip():
+                    st.error("اسم الأداة أو الوسيلة مطلوب.")
+                else:
+                    supply_id = uid("SUP")
+                    supplies.append({
+                        "id": supply_id,
+                        "name": supply_name.strip(),
+                        "category": supply_category,
+                        "unit": supply_unit.strip() or "قطعة",
+                        "quantity": float(supply_quantity),
+                        "min_quantity": float(supply_min),
+                        "location": supply_location.strip(),
+                        "notes": supply_notes.strip(),
+                        "created_at": str(date.today()),
+                        "updated_at": str(date.today()),
+                        "created_by": current_user,
+                    })
+                    add_supply_movement(supply_id, "إضافة أولية", supply_quantity, "إضافة صنف جديد")
+                    save_all_data()
+                    write_audit("ADD_SUPPLY", f"name={supply_name.strip()}")
+                    st.success("✅ تمت إضافة الأداة إلى المخزون.")
+                    st.rerun()
+
+        if supplies:
+            st.markdown("#### الأصناف المسجلة")
+            supply_rows = []
+            for item in supplies:
+                quantity = float(item.get("quantity", 0))
+                minimum = float(item.get("min_quantity", 0))
+                supply_rows.append({
+                    "id": item.get("id", ""),
+                    "الأداة/الوسيلة": item.get("name", ""),
+                    "الفئة": item.get("category", ""),
+                    "الكمية": f"{quantity:g} {item.get('unit', 'قطعة')}",
+                    "الحد الأدنى": f"{minimum:g}",
+                    "الحالة": "⚠️ يحتاج إعادة توفير" if quantity <= minimum else "✅ متوفر",
+                    "مكان التخزين": item.get("location", "") or "—",
+                })
+            st.dataframe(
+                pd.DataFrame(supply_rows).drop(columns=["id"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            supply_ids = [item["id"] for item in supplies]
+            selected_supply_id = st.selectbox(
+                "اختر صنفاً للتعديل أو تسجيل الاستهلاك",
+                supply_ids,
+                format_func=lambda x: f"{supply_by_id(x).get('name', x)} — {supply_by_id(x).get('category', '')}",
+            )
+            selected_supply = supply_by_id(selected_supply_id)
+            if selected_supply:
+                edit_col, use_col = st.columns([1.4, 1])
+                with edit_col:
+                    with st.form("edit_supply_form"):
+                        edited_supply_name = st.text_input("اسم الأداة/الوسيلة", value=selected_supply.get("name", ""))
+                        edited_category = st.selectbox(
+                            "الفئة",
+                            ["بطاقات وصور", "ألعاب تعليمية", "أدوات فنية", "أدوات نطق", "قرطاسية", "نظافة وسلامة", "أخرى"],
+                            index=["بطاقات وصور", "ألعاب تعليمية", "أدوات فنية", "أدوات نطق", "قرطاسية", "نظافة وسلامة", "أخرى"].index(selected_supply.get("category", "أخرى"))
+                            if selected_supply.get("category", "أخرى") in ["بطاقات وصور", "ألعاب تعليمية", "أدوات فنية", "أدوات نطق", "قرطاسية", "نظافة وسلامة", "أخرى"] else 6,
+                        )
+                        e1, e2 = st.columns(2)
+                        edited_quantity = e1.number_input("الكمية", min_value=0.0, value=float(selected_supply.get("quantity", 0)), step=1.0)
+                        edited_min = e2.number_input("حد التنبيه", min_value=0.0, value=float(selected_supply.get("min_quantity", 0)), step=1.0)
+                        edited_unit = st.text_input("وحدة القياس", value=selected_supply.get("unit", "قطعة"))
+                        edited_location = st.text_input("مكان التخزين", value=selected_supply.get("location", ""))
+                        edited_notes = st.text_area("ملاحظات", value=selected_supply.get("notes", ""))
+                        if st.form_submit_button("💾 حفظ بيانات الصنف", use_container_width=True):
+                            if not edited_supply_name.strip():
+                                st.error("اسم الأداة أو الوسيلة مطلوب.")
+                            else:
+                                old_quantity = float(selected_supply.get("quantity", 0))
+                                new_quantity = float(edited_quantity)
+                                selected_supply.update({
+                                    "name": edited_supply_name.strip(),
+                                    "category": edited_category,
+                                    "quantity": new_quantity,
+                                    "min_quantity": float(edited_min),
+                                    "unit": edited_unit.strip() or "قطعة",
+                                    "location": edited_location.strip(),
+                                    "notes": edited_notes.strip(),
+                                    "updated_at": str(date.today()),
+                                })
+                                if new_quantity != old_quantity:
+                                    movement_type = "إضافة يدوية" if new_quantity > old_quantity else "تسوية كمية"
+                                    add_supply_movement(
+                                        selected_supply_id,
+                                        movement_type,
+                                        abs(new_quantity - old_quantity),
+                                        "تعديل مباشر من بيانات الصنف",
+                                    )
+                                save_all_data()
+                                write_audit("UPDATE_SUPPLY", f"id={selected_supply_id}")
+                                st.success("✅ تم تحديث بيانات الصنف.")
+                                st.rerun()
+
+                with use_col:
+                    st.markdown("#### إعادة توفير")
+                    restock_quantity = st.number_input(
+                        "الكمية المضافة",
+                        min_value=0.0,
+                        value=0.0,
+                        step=1.0,
+                        key=f"restock_{selected_supply_id}",
+                    )
+                    if st.button("📈 إضافة إلى المخزون", use_container_width=True):
+                        if restock_quantity <= 0:
+                            st.error("أدخل كمية أكبر من صفر.")
+                        else:
+                            selected_supply["quantity"] = float(selected_supply.get("quantity", 0)) + float(restock_quantity)
+                            selected_supply["updated_at"] = str(date.today())
+                            add_supply_movement(
+                                selected_supply_id,
+                                "إعادة توفير",
+                                restock_quantity,
+                                "إضافة كمية من شاشة المخزون",
+                            )
+                            save_all_data()
+                            write_audit("RESTOCK_SUPPLY", f"id={selected_supply_id} quantity={restock_quantity}")
+                            st.success("✅ تمت إضافة الكمية إلى المخزون.")
+                            st.rerun()
+
+                    st.markdown("#### تسجيل الاستهلاك")
+                    consumed_quantity = st.number_input(
+                        "الكمية المستخدمة",
+                        min_value=0.0,
+                        max_value=float(selected_supply.get("quantity", 0)),
+                        value=1.0 if float(selected_supply.get("quantity", 0)) >= 1 else 0.0,
+                        step=1.0,
+                        key=f"consume_{selected_supply_id}",
+                    )
+                    if st.button("📉 خصم من المخزون", use_container_width=True):
+                        if consumed_quantity <= 0:
+                            st.error("أدخل كمية أكبر من صفر.")
+                        else:
+                            selected_supply["quantity"] = max(
+                                0.0, float(selected_supply.get("quantity", 0)) - float(consumed_quantity)
+                            )
+                            selected_supply["updated_at"] = str(date.today())
+                            add_supply_movement(
+                                selected_supply_id,
+                                "استهلاك يدوي",
+                                consumed_quantity,
+                                "خصم من شاشة المخزون",
+                            )
+                            save_all_data()
+                            write_audit("CONSUME_SUPPLY", f"id={selected_supply_id} quantity={consumed_quantity}")
+                            st.success("✅ تم خصم الكمية من المخزون.")
+                            st.rerun()
+
+                    st.markdown('<div class="warning-box">الحذف يزيل الصنف من سجل المخزون نهائياً.</div>', unsafe_allow_html=True)
+                    confirm_supply_delete = st.checkbox("أؤكد حذف هذا الصنف", key=f"confirm_supply_delete_{selected_supply_id}")
+                    if st.button("🗑️ حذف الصنف", type="secondary", use_container_width=True):
+                        if not confirm_supply_delete:
+                            st.error("فعّل التأكيد قبل الحذف.")
+                        else:
+                            db["supplies"] = [item for item in supplies if item.get("id") != selected_supply_id]
+                            save_all_data()
+                            write_audit("DELETE_SUPPLY", f"id={selected_supply_id}")
+                            st.success("تم حذف الصنف.")
+                            st.rerun()
+        else:
+            st.info("لم تتم إضافة لوازم بعد. ابدأ بإضافة الأدوات المستخدمة في الحصص.")
+
+    with tab_supply_history:
+        st.subheader("📜 سجل حركة المخزون")
+        movements = db.get("supply_movements", [])
+        if movements:
+            movement_df = pd.DataFrame(movements).sort_values("date", ascending=False)
+            movement_df["quantity"] = pd.to_numeric(movement_df["quantity"], errors="coerce").fillna(0)
+            movement_df["quantity"] = movement_df.apply(
+                lambda row: f"{'+' if 'إضافة' in str(row['type']) or 'إعادة' in str(row['type']) else '-'}{row['quantity']:g}",
+                axis=1,
+            )
+            st.dataframe(
+                movement_df[["date", "supply_name", "type", "quantity", "note"]].rename(columns={
+                    "date": "التاريخ",
+                    "supply_name": "الأداة/الوسيلة",
+                    "type": "نوع الحركة",
+                    "quantity": "الكمية",
+                    "note": "الملاحظة",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("لا توجد حركات مسجلة للمخزون بعد.")
+
+    with tab_reminders:
+        st.subheader("🔔 التذكيرات والمهام")
+        patients_for_reminders = patients_dict()
+        with st.form("add_reminder_form", clear_on_submit=True):
+            r1, r2, r3 = st.columns(3)
+            reminder_title = r1.text_input("عنوان التذكير *", placeholder="مثال: الاتصال بولي الأمر")
+            reminder_kind = r2.selectbox("النوع", ["موعد", "مهمة إدارية", "متابعة طفل", "تجهيز حصة", "إعادة توفير لوازم", "أخرى"])
+            reminder_priority = r3.selectbox("الأولوية", ["عادية", "مهمة", "عاجلة"])
+            r4, r5, r6 = st.columns(3)
+            reminder_date = r4.date_input("تاريخ الاستحقاق", value=date.today())
+            reminder_time = r5.time_input("الوقت", value=datetime.now().replace(second=0, microsecond=0).time())
+            reminder_repeat = r6.selectbox("التكرار", ["لا يتكرر", "يومياً", "أسبوعياً", "شهرياً"])
+            reminder_patient = st.selectbox(
+                "ربط بطفل (اختياري)",
+                ["بدون ربط"] + list(patients_for_reminders),
+                format_func=lambda x: "بدون ربط" if x == "بدون ربط" else patients_for_reminders[x],
+            )
+            reminder_notes = st.text_area("تفاصيل التذكير")
+            if st.form_submit_button("➕ إضافة التذكير", use_container_width=True):
+                if not reminder_title.strip():
+                    st.error("عنوان التذكير مطلوب.")
+                else:
+                    patient_id = None if reminder_patient == "بدون ربط" else reminder_patient
+                    reminder_id = uid("REM")
+                    reminders.append({
+                        "id": reminder_id,
+                        "series_id": reminder_id,
+                        "title": reminder_title.strip(),
+                        "kind": reminder_kind,
+                        "priority": reminder_priority,
+                        "due_date": str(reminder_date),
+                        "due_time": str(reminder_time)[:5],
+                        "repeat": reminder_repeat,
+                        "patient_id": patient_id,
+                        "patient_name": patient_name(patient_id) if patient_id else "",
+                        "notes": reminder_notes.strip(),
+                        "status": "مفتوح",
+                        "created_at": datetime.now().isoformat(timespec="minutes"),
+                        "created_by": current_user,
+                    })
+                    save_all_data()
+                    write_audit("ADD_REMINDER", f"title={reminder_title.strip()}")
+                    st.success("✅ تمت إضافة التذكير.")
+                    st.rerun()
+
+        if reminders:
+            f1, f2 = st.columns(2)
+            reminder_status_filter = f1.selectbox("تصفية الحالة", ["الكل", "مفتوح", "قيد التنفيذ", "منجز", "ملغى"])
+            reminder_period_filter = f2.selectbox("تصفية الفترة", ["الكل", "متأخر", "اليوم", "هذا الأسبوع"])
+            shown_reminders = list(reminders)
+            if reminder_status_filter != "الكل":
+                shown_reminders = [r for r in shown_reminders if r.get("status", "مفتوح") == reminder_status_filter]
+            if reminder_period_filter == "متأخر":
+                shown_reminders = [r for r in shown_reminders if reminder_is_overdue(r)]
+            elif reminder_period_filter == "اليوم":
+                shown_reminders = [r for r in shown_reminders if r.get("due_date") == str(date.today())]
+            elif reminder_period_filter == "هذا الأسبوع":
+                week_start = date.today() - timedelta(days=date.today().weekday())
+                week_end = week_start + timedelta(days=6)
+                shown_reminders = [
+                    r for r in shown_reminders
+                    if str(week_start) <= r.get("due_date", "") <= str(week_end)
+                ]
+
+            if shown_reminders:
+                reminder_rows = []
+                for item in sorted(shown_reminders, key=lambda r: (r.get("due_date", ""), r.get("due_time", ""))):
+                    status = item.get("status", "مفتوح")
+                    reminder_rows.append({
+                        "id": item.get("id", ""),
+                        "العنوان": item.get("title", ""),
+                        "النوع": item.get("kind", ""),
+                        "الاستحقاق": f"{item.get('due_date', '')} {item.get('due_time', '')}",
+                        "الطفل": reminder_patient_label(item),
+                        "الأولوية": item.get("priority", ""),
+                        "الحالة": "🚨 متأخر" if reminder_is_overdue(item) else status,
+                    })
+                st.dataframe(
+                    pd.DataFrame(reminder_rows).drop(columns=["id"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                reminder_ids = [item["id"] for item in shown_reminders]
+                selected_reminder_id = st.selectbox(
+                    "اختر تذكيراً لتحديثه",
+                    reminder_ids,
+                    format_func=lambda x: f"{reminder_by_id(x).get('due_date', '')} — {reminder_by_id(x).get('title', x)}",
+                )
+                selected_reminder = reminder_by_id(selected_reminder_id)
+                if selected_reminder:
+                    update_col, delete_col = st.columns([1.5, 1])
+                    with update_col:
+                        new_reminder_status = st.selectbox(
+                            "الحالة الجديدة",
+                            ["مفتوح", "قيد التنفيذ", "منجز", "ملغى"],
+                            index=["مفتوح", "قيد التنفيذ", "منجز", "ملغى"].index(selected_reminder.get("status", "مفتوح"))
+                            if selected_reminder.get("status", "مفتوح") in ["مفتوح", "قيد التنفيذ", "منجز", "ملغى"] else 0,
+                        )
+                        if st.button("💾 تحديث حالة التذكير", use_container_width=True):
+                            selected_reminder["status"] = new_reminder_status
+                            selected_reminder["completed_at"] = datetime.now().isoformat(timespec="minutes") if new_reminder_status == "منجز" else ""
+                            next_created = False
+                            if new_reminder_status == "منجز":
+                                try:
+                                    next_created = create_next_recurring_reminder(selected_reminder)
+                                except (TypeError, ValueError):
+                                    next_created = False
+                            save_all_data()
+                            write_audit("UPDATE_REMINDER", f"id={selected_reminder_id} status={new_reminder_status}")
+                            if next_created:
+                                st.success("✅ تم إنجاز التذكير وإنشاء موعده التالي تلقائياً.")
+                            else:
+                                st.success("✅ تم تحديث حالة التذكير.")
+                            st.rerun()
+                        if selected_reminder.get("notes"):
+                            st.info(selected_reminder["notes"])
+                    with delete_col:
+                        st.markdown('<div class="warning-box">حذف التذكير نهائي.</div>', unsafe_allow_html=True)
+                        confirm_reminder_delete = st.checkbox("أؤكد الحذف", key=f"confirm_reminder_delete_{selected_reminder_id}")
+                        if st.button("🗑️ حذف التذكير", type="secondary", use_container_width=True):
+                            if not confirm_reminder_delete:
+                                st.error("فعّل التأكيد قبل الحذف.")
+                            else:
+                                db["reminders"] = [item for item in reminders if item.get("id") != selected_reminder_id]
+                                save_all_data()
+                                write_audit("DELETE_REMINDER", f"id={selected_reminder_id}")
+                                st.success("تم حذف التذكير.")
+                                st.rerun()
+            else:
+                st.info("لا توجد تذكيرات توافق التصفية الحالية.")
+        else:
+            st.info("لا توجد تذكيرات بعد. أضف تذكيراً لمهمة أو موعد أو متابعة.")
+
+    with tab_overview:
+        st.subheader("📊 المتابعة السريعة")
+        overview_col1, overview_col2 = st.columns(2)
+        with overview_col1:
+            st.markdown("#### 🚨 المتأخرة")
+            if overdue_reminders:
+                for item in sorted(overdue_reminders, key=lambda r: r.get("due_date", "")):
+                    st.markdown(
+                        f'<div class="danger-box"><strong>{item.get("title", "")}</strong><br>'
+                        f'{item.get("due_date", "—")} • {reminder_patient_label(item)}</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.success("✅ لا توجد تذكيرات متأخرة.")
+        with overview_col2:
+            st.markdown("#### ⚠️ لوازم تحتاج إعادة توفير")
+            if low_stock:
+                for item in low_stock:
+                    st.markdown(
+                        f'<div class="warning-box"><strong>{item.get("name", "")}</strong><br>'
+                        f'المتاح: {float(item.get("quantity", 0)):g} {item.get("unit", "قطعة")} '
+                        f'— الحد الأدنى: {float(item.get("min_quantity", 0)):g}</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.success("✅ مستويات المخزون جيدة.")
+
+
+# =========================================================
+# 17) الإدارة المالية
 # =========================================================
 elif menu == "💰 الإدارة المالية":
     st.title("💰 الإدارة المالية والفوترة")
@@ -1678,7 +2209,7 @@ elif menu == "💰 الإدارة المالية":
                     "رسوم جلسة", "رسوم تقييم", "مصاريف إيجار", "مصاريف معدات", "مصاريف مستلزمات", "راتب", "أخرى"
                 ])
                 f_patient = st.selectbox(
-                    "المريض (اختياري)",
+                    "الطفل (اختياري)",
                     ["بدون ربط"] + [p["id"] for p in db["patients"]],
                     format_func=lambda x: "بدون ربط" if x == "بدون ربط" else patient_name(x),
                 )
@@ -1783,22 +2314,22 @@ elif menu == "🤖 المساعد الذكي":
         "تحليل حالة وبناء خطة أولية",
         "اقتراح أنشطة وتمارين لغوية",
         "صياغة تقرير مهني للأهل",
-        "تلخيص سجل المريض",
+        "تلخيص سجل الطفل",
         "اقتراح أهداف جلسة قادمة",
         "كتابة برنامج منزلي مفصل",
         "ترجمة تقرير للأهل بلغة مبسطة",
     ])
 
-    # تحميل بيانات مريض موجود
+    # تحميل بيانات طفل موجود
     if db["patients"]:
-        use_patient = st.checkbox("استخدم بيانات مريض موجود")
+        use_patient = st.checkbox("استخدم بيانات طفل موجود")
         if use_patient:
             patients = patients_dict()
-            sel_pid = st.selectbox("المريض", list(patients), format_func=lambda x: f"{patients[x]} — {x}")
+            sel_pid = st.selectbox("الطفل", list(patients), format_func=lambda x: f"{patients[x]} — {x}")
             p = patient_by_id(sel_pid)
             if p:
                 auto_context = f"""
-المريض: {p.get("name", "")}
+الطفل: {p.get("name", "")}
 العمر: {age_label(p.get("dob", ""))}
 الجنس: {p.get("gender", "")}
 التشخيص: {p.get("diagnosis", "")}
@@ -1885,7 +2416,7 @@ elif menu == "📚 مكتبة العيادة":
         activities = {
             "🗣️ تقليد الحركات الفموية": "أمام مرآة: فتح الفم، إخراج اللسان، رفع اللسان، تحريكه يميناً ويساراً. 5 تكرارات لكل حركة.",
             "🎵 أغاني ولغة": "استخدم أغاني الأطفال المعروفة مع التركيز على المفردات الجديدة وتكرارها بشكل ممتع.",
-            "📖 قراءة مشتركة": "اقرأ قصة قصيرة مع المريض، اسأل عن الشخصيات، الحدث، ثم اطلب إعادة السرد.",
+            "📖 قراءة مشتركة": "اقرأ قصة قصيرة مع الطفل، اسأل عن الشخصيات، الحدث، ثم اطلب إعادة السرد.",
             "🎲 تمرين التسمية": "اعرض صوراً لأشياء يومية واطلب تسميتها. ابدأ بالمفردات المعروفة ثم المجهولة.",
             "🗺️ وصف الصور": "قدّم صورة مشهد يومي (ملعب، مطبخ) واطلب وصف ما يراه في جمل.",
             "🔊 تمارين النطق": "تدريب تسلسلي للأصوات: الصوت منفرداً → في مقطع → في كلمة → في جملة.",
@@ -1949,14 +2480,14 @@ elif menu == "📚 مكتبة العيادة":
 elif menu == "📄 التقارير والتصدير":
     st.title("📄 التقارير والتصدير")
 
-    t_data, t_patient, t_financial, t_backups = st.tabs(["💾 تصدير البيانات", "👤 تقرير المريض", "💰 التقرير المالي", "🗄️ النسخ الاحتياطية"])
+    t_data, t_patient, t_financial, t_backups = st.tabs(["💾 تصدير البيانات", "👤 تقرير الطفل", "💰 التقرير المالي", "🗄️ النسخ الاحتياطية"])
 
     with t_data:
         st.subheader("تصدير بيانات الحساب")
         c1, c2 = st.columns(2)
         c1.download_button("⬇️ تصدير JSON", data=export_current_user_data(), file_name=f"clinic_{current_user}_{date.today().isoformat()}.json", mime="application/json", use_container_width=True)
         if db["patients"]:
-            c2.download_button("⬇️ تصدير المرضى CSV", data=pd.DataFrame(db["patients"]).to_csv(index=False).encode("utf-8-sig"), file_name=f"patients_{date.today().isoformat()}.csv", mime="text/csv", use_container_width=True)
+            c2.download_button("⬇️ تصدير الأطفال CSV", data=pd.DataFrame(db["patients"]).to_csv(index=False).encode("utf-8-sig"), file_name=f"patients_{date.today().isoformat()}.csv", mime="text/csv", use_container_width=True)
         if db["sessions"]:
             c1.download_button("⬇️ تصدير الجلسات CSV", data=pd.DataFrame(db["sessions"]).to_csv(index=False).encode("utf-8-sig"), file_name=f"sessions_{date.today().isoformat()}.csv", mime="text/csv", use_container_width=True)
         if db["finances"]:
@@ -1964,9 +2495,9 @@ elif menu == "📄 التقارير والتصدير":
 
     with t_patient:
         if not db["patients"]:
-            st.info("أضف مريضاً أولاً.")
+            st.info("أضف طفلاً أولاً.")
         else:
-            p_id = st.selectbox("اختر مريضاً", [p["id"] for p in db["patients"]], format_func=lambda x: f"{patient_name(x)} — {x}")
+            p_id = st.selectbox("اختر طفلاً", [p["id"] for p in db["patients"]], format_func=lambda x: f"{patient_name(x)} — {x}")
             p = patient_by_id(p_id)
             sessions = patient_sessions(p_id)
             evaluations = patient_evaluations(p_id)
@@ -1977,7 +2508,7 @@ elif menu == "📄 التقارير والتصدير":
             # معاينة التقرير
             st.markdown(f"""
             ---
-            **تقرير ملف المريض**
+            **تقرير ملف الطفل**
             - **الاسم:** {p.get("name", "")}
             - **رقم الملف:** {p.get("id", "")}
             - **العمر:** {age_label(p.get("dob",""))} | **الجنس:** {p.get("gender","")}
@@ -2097,6 +2628,12 @@ elif menu == "⚙️ الإعدادات والأمان":
             working_hours = c5.text_input("ساعات العمل", value=s_settings.get("working_hours", "8:00 - 17:00"))
             max_apts = c6.number_input("أقصى مواعيد يومية", min_value=1, max_value=30, value=int(s_settings.get("max_daily_appointments", 8)))
             gemini_model = st.text_input("نموذج Gemini", value=s_settings.get("gemini_model", "gemini-2.5-flash"))
+            reminder_days_setting = st.number_input(
+                "التذكير بالموعد قبل (بالأيام)",
+                min_value=0,
+                max_value=30,
+                value=int(s_settings.get("reminder_days", 1)),
+            )
 
             if st.form_submit_button("💾 حفظ الإعدادات", use_container_width=True):
                 s_settings.update({
@@ -2108,6 +2645,7 @@ elif menu == "⚙️ الإعدادات والأمان":
                     "working_hours": working_hours.strip(),
                     "max_daily_appointments": int(max_apts),
                     "gemini_model": gemini_model.strip(),
+                    "reminder_days": int(reminder_days_setting),
                 })
                 atomic_write_json(SETTINGS_FILE, s_settings)
                 st.success("✅ تم حفظ الإعدادات.")
@@ -2230,30 +2768,87 @@ elif menu == "👑 إدارة المستخدمين" and user_role == "admin":
             target = st.selectbox("الحساب", other_users, format_func=lambda u: f"{u} ({st.session_state['users_db'][u].get('full_name','')})")
             target_user = st.session_state["users_db"][target]
 
-            col1, col2 = st.columns(2)
-            with col1:
-                new_state = st.selectbox("حالة الحساب", ["نشط", "معطل"], index=0 if target_user.get("active", True) else 1)
-                new_role_target = st.selectbox("الصلاحية", ["therapist", "admin", "receptionist"],
-                    index=["therapist", "admin", "receptionist"].index(target_user.get("role", "therapist")) if target_user.get("role") in ["therapist", "admin", "receptionist"] else 0)
-                if st.button("💾 حفظ التغييرات"):
-                    target_user["active"] = new_state == "نشط"
-                    target_user["role"] = new_role_target
-                    save_users()
-                    write_audit("UPDATE_USER", f"target={target} active={new_state} role={new_role_target}")
-                    st.success("تم تحديث الحساب.")
-                    st.rerun()
+            st.markdown("### ✏️ تعديل بيانات الحساب")
+            with st.form("edit_user_form"):
+                e1, e2 = st.columns(2)
+                edited_username = e1.text_input("اسم المستخدم (للدخول) *", value=target)
+                edited_full_name = e2.text_input("الاسم الظاهر *", value=target_user.get("full_name", ""))
+                e3, e4 = st.columns(2)
+                edited_phone = e3.text_input("الهاتف", value=target_user.get("phone", ""))
+                edited_email = e4.text_input("البريد الإلكتروني", value=target_user.get("email", ""))
+                e5, e6 = st.columns(2)
+                new_state = e5.selectbox("حالة الحساب", ["نشط", "معطل"], index=0 if target_user.get("active", True) else 1)
+                roles = ["therapist", "admin", "receptionist"]
+                current_role_index = roles.index(target_user.get("role", "therapist")) if target_user.get("role") in roles else 0
+                new_role_target = e6.selectbox("الصلاحية", roles, index=current_role_index)
 
-            with col2:
-                st.markdown("**إعادة تعيين كلمة المرور:**")
-                new_pwd_reset = st.text_input("كلمة المرور الجديدة", type="password", key="reset_pwd")
-                if st.button("🔑 إعادة تعيين"):
+                if st.form_submit_button("💾 حفظ بيانات الحساب", use_container_width=True):
+                    renamed_key = normalize_username(edited_username)
+                    errors = []
+                    if not renamed_key:
+                        errors.append("اسم المستخدم مطلوب.")
+                    elif renamed_key != target and renamed_key in st.session_state["users_db"]:
+                        errors.append("اسم المستخدم الجديد مستخدم مسبقاً.")
+                    if not edited_full_name.strip():
+                        errors.append("الاسم الظاهر مطلوب.")
+                    if errors:
+                        for error in errors:
+                            st.error(error)
+                    else:
+                        target_user.update({
+                            "full_name": edited_full_name.strip(),
+                            "phone": edited_phone.strip(),
+                            "email": edited_email.strip(),
+                            "active": new_state == "نشط",
+                            "role": new_role_target,
+                            "updated_at": str(date.today()),
+                        })
+                        if renamed_key != target:
+                            st.session_state["users_db"][renamed_key] = st.session_state["users_db"].pop(target)
+                            if target in st.session_state["all_data"]:
+                                st.session_state["all_data"][renamed_key] = st.session_state["all_data"].pop(target)
+                            write_audit("RENAME_USER", f"from={target} to={renamed_key}")
+                            save_all_data()
+                        save_users()
+                        write_audit("UPDATE_USER", f"target={renamed_key} active={new_state} role={new_role_target}")
+                        st.success("✅ تم تحديث الحساب وحفظ بياناته.")
+                        st.rerun()
+
+            st.markdown("### 🔑 إعادة تعيين كلمة المرور")
+            with st.form("reset_user_password_form"):
+                new_pwd_reset = st.text_input("كلمة المرور الجديدة", type="password")
+                confirm_pwd_reset = st.text_input("تأكيد كلمة المرور الجديدة", type="password")
+                if st.form_submit_button("🔑 إعادة تعيين كلمة المرور"):
                     if len(new_pwd_reset) < 8:
-                        st.error("8 أحرف على الأقل.")
+                        st.error("كلمة المرور يجب أن تكون 8 أحرف على الأقل.")
+                    elif new_pwd_reset != confirm_pwd_reset:
+                        st.error("تأكيد كلمة المرور غير مطابق.")
                     else:
                         target_user["password"] = hash_password(new_pwd_reset)
                         save_users()
                         write_audit("RESET_PASSWORD", f"target={target}")
-                        st.success("تم إعادة تعيين كلمة المرور.")
+                        st.success("✅ تم إعادة تعيين كلمة المرور.")
+
+            st.markdown("### 🗑️ حذف الحساب")
+            st.markdown(
+                '<div class="danger-box">سيؤدي حذف الحساب إلى إزالة بيانات دخوله وبيانات العيادة المرتبطة به نهائياً، ولا يمكن التراجع عنه.</div>',
+                unsafe_allow_html=True,
+            )
+            confirm_user_delete = st.checkbox("أفهم أن حذف الحساب وبياناته نهائي", key=f"confirm_user_delete_{target}")
+            if st.button("🗑️ حذف الحساب نهائياً", type="secondary"):
+                admin_count = sum(1 for item in st.session_state["users_db"].values() if item.get("role") == "admin")
+                if not confirm_user_delete:
+                    st.error("فعّل التأكيد قبل حذف الحساب.")
+                elif target_user.get("role") == "admin" and admin_count <= 1:
+                    st.error("لا يمكن حذف آخر حساب مدير في النظام.")
+                else:
+                    write_audit("DELETE_USER", f"target={target}")
+                    del st.session_state["users_db"][target]
+                    st.session_state["all_data"].pop(target, None)
+                    save_users()
+                    save_all_data()
+                    st.success("✅ تم حذف الحساب وبياناته.")
+                    st.rerun()
         else:
             st.info("لا توجد حسابات أخرى.")
 
